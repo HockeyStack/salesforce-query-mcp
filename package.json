@@ -1,0 +1,32 @@
+{
+  "name": "salesforce-query-mcp",
+  "version": "1.0.0",
+  "description": "MCP server for running Salesforce SOQL queries and describe calls",
+  "type": "module",
+  "bin": {
+    "salesforce-query-mcp": "./build/index.js"
+  },
+  "scripts": {
+    "build": "tsc && chmod 755 build/index.js",
+    "prepublishOnly": "npm run build"
+  },
+  "files": [
+    "build"
+  ],
+  "keywords": [
+    "mcp",
+    "salesforce",
+    "soql",
+    "model-context-protocol"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.0",
+    "open": "^10.1.0",
+    "zod": "^3.24.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.7.0"
+  }
+}
