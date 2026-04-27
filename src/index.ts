@@ -579,11 +579,9 @@ server.tool(
 );
 
 // Tool: search flows
-const FLOW_METADATA_FETCH_LIMIT = 20;
-
 server.tool(
   "sf_search_flows",
-  `Search Salesforce flows for references to fields, objects, or picklist values. All flows are checked by label/description (surface search). The first ${FLOW_METADATA_FETCH_LIMIT} flows also have their full metadata JSON searched (deep search). Defaults to active flows only.`,
+  "Search Salesforce flows for references to fields, objects, or picklist values. All flows are fetched and have their full metadata JSON searched in parallel. Defaults to active flows only.",
   {
     searchTerms: z
       .array(z.string())
@@ -620,29 +618,21 @@ server.tool(
         };
       }
 
-      const matches: any[] = [];
-      const limitations: string[] = [];
-      let metadataFetched = 0;
+      const results = await Promise.all(
+        flows.map(async (flow) => {
+          const surfaceText = [flow.MasterLabel, flow.Description, flow.ProcessType]
+            .filter(Boolean)
+            .join(" ");
+          const surfaceMatches = searchTerms.filter((t) =>
+            surfaceText.toLowerCase().includes(t.toLowerCase())
+          );
 
-      for (const flow of flows) {
-        const surfaceText = [flow.MasterLabel, flow.Description, flow.ProcessType]
-          .filter(Boolean)
-          .join(" ");
-        const surfaceMatches = searchTerms.filter((t) =>
-          surfaceText.toLowerCase().includes(t.toLowerCase())
-        );
+          let deepMatches: string[] = [];
+          let deepSnippets: string[] = [];
+          let metadataNote: string | null = null;
 
-        let deepMatches: string[] = [];
-        let deepSnippets: string[] = [];
-        let metadataSearched = false;
-        let metadataNote: string | null = null;
-
-        if (metadataFetched < FLOW_METADATA_FETCH_LIMIT) {
           try {
             const detail = await sfToolingRecord("Flow", flow.Id);
-            metadataFetched++;
-            metadataSearched = true;
-
             if (detail.Metadata) {
               const metaStr = JSON.stringify(detail.Metadata);
               deepMatches = searchTerms.filter((t) =>
@@ -655,12 +645,15 @@ server.tool(
           } catch {
             metadataNote = "Failed to retrieve flow metadata";
           }
-        } else {
-          metadataNote = `Metadata depth search skipped (limit of ${FLOW_METADATA_FETCH_LIMIT} reached) — surface fields only`;
-        }
 
+          return { flow, surfaceMatches, deepMatches, deepSnippets, metadataNote };
+        })
+      );
+
+      const matches: any[] = [];
+
+      for (const { flow, surfaceMatches, deepMatches, deepSnippets, metadataNote } of results) {
         const allMatchedTerms = [...new Set([...surfaceMatches, ...deepMatches])];
-
         if (allMatchedTerms.length > 0) {
           matches.push({
             id: flow.Id,
@@ -672,17 +665,10 @@ server.tool(
             matchedTerms: allMatchedTerms,
             surfaceMatch: surfaceMatches.length > 0,
             metadataMatch: deepMatches.length > 0,
-            metadataSearched,
             snippets: deepSnippets,
             metadataNote,
           });
         }
-      }
-
-      if (flows.length > FLOW_METADATA_FETCH_LIMIT) {
-        limitations.push(
-          `Deep metadata search was limited to the first ${FLOW_METADATA_FETCH_LIMIT} flows. ${flows.length - metadataFetched} additional flow(s) were checked by label/description only. Use sf_tooling_query to manually inspect specific flows.`
-        );
       }
 
       return {
@@ -694,9 +680,7 @@ server.tool(
                 searchTerms,
                 activeOnly,
                 totalFlowsChecked: flows.length,
-                metadataFetched,
                 totalMatches: matches.length,
-                limitations,
                 matches,
               },
               null,
@@ -809,24 +793,22 @@ server.tool(
     try {
       const soql = `SELECT Id, MasterLabel, Status, ProcessType, VersionNumber, Description FROM Flow WHERE Status = 'Active' ORDER BY MasterLabel ASC LIMIT 200`;
       const flows = await sfToolingQueryPaginated(soql);
-      let metadataFetched = 0;
 
-      for (const flow of flows) {
-        const surfaceText = [flow.MasterLabel, flow.Description, flow.ProcessType]
-          .filter(Boolean)
-          .join(" ");
-        const surfaceMatches = searchTerms.filter((t) =>
-          surfaceText.toLowerCase().includes(t.toLowerCase())
-        );
+      const flowResults = await Promise.all(
+        flows.map(async (flow) => {
+          const surfaceText = [flow.MasterLabel, flow.Description, flow.ProcessType]
+            .filter(Boolean)
+            .join(" ");
+          const surfaceMatches = searchTerms.filter((t) =>
+            surfaceText.toLowerCase().includes(t.toLowerCase())
+          );
 
-        let deepMatches: string[] = [];
-        let deepSnippets: string[] = [];
-        let metadataNote: string | null = null;
+          let deepMatches: string[] = [];
+          let deepSnippets: string[] = [];
+          let metadataNote: string | null = null;
 
-        if (metadataFetched < FLOW_METADATA_FETCH_LIMIT) {
           try {
             const detail = await sfToolingRecord("Flow", flow.Id);
-            metadataFetched++;
             if (detail.Metadata) {
               const metaStr = JSON.stringify(detail.Metadata);
               deepMatches = searchTerms.filter((t) =>
@@ -839,12 +821,13 @@ server.tool(
           } catch {
             metadataNote = "Failed to retrieve flow metadata";
           }
-        } else {
-          metadataNote = `Metadata depth search skipped (limit of ${FLOW_METADATA_FETCH_LIMIT} reached)`;
-        }
 
+          return { flow, surfaceMatches, deepMatches, deepSnippets, metadataNote };
+        })
+      );
+
+      for (const { flow, surfaceMatches, deepMatches, deepSnippets, metadataNote } of flowResults) {
         const allMatchedTerms = [...new Set([...surfaceMatches, ...deepMatches])];
-
         if (allMatchedTerms.length > 0) {
           flowMatches.push({
             id: flow.Id,
@@ -857,12 +840,6 @@ server.tool(
             metadataNote,
           });
         }
-      }
-
-      if (flows.length > FLOW_METADATA_FETCH_LIMIT) {
-        limitations.push(
-          `Flow metadata deep search was limited to ${FLOW_METADATA_FETCH_LIMIT} flows. ${flows.length} active flow(s) exist — remaining flows were checked by label/description only. Run sf_search_flows for a targeted re-search.`
-        );
       }
     } catch (err) {
       flowError = err instanceof Error ? err.message : String(err);
@@ -878,6 +855,9 @@ server.tool(
     );
     limitations.push(
       "Process Builder automations use ProcessType = 'Workflow' — run sf_get_flows with processType='Workflow' to review them separately."
+    );
+    limitations.push(
+      "Flow search is limited to 200 active flows per query. If your org has more than 200 active flows, add processType filters to narrow the scope."
     );
 
     // Recommended Next Steps
