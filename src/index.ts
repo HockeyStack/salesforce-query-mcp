@@ -3,6 +3,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
+import { PDFParse } from "pdf-parse";
 
 // Config
 const API_VERSION = "v62.0";
@@ -136,6 +137,33 @@ function extractSnippets(text: string, terms: string[], contextChars = 120): str
   }
 
   return snippets;
+}
+
+// Downloads binary content (e.g. file attachments) from Salesforce and returns
+// a Buffer. Used for PDF and other file content endpoints.
+async function sfRequestBinary(path: string): Promise<Buffer> {
+  await ensureToken();
+
+  const url = `${instanceUrl}/services/data/${API_VERSION}${path}`;
+
+  let res = await fetch(url, {
+    headers: { Authorization: `Bearer ${accessToken}` },
+  });
+
+  if (res.status === 401) {
+    await refreshAccessToken();
+    res = await fetch(url, {
+      headers: { Authorization: `Bearer ${accessToken}` },
+    });
+  }
+
+  if (!res.ok) {
+    const errorBody = await res.text();
+    throw new Error(`Salesforce API error (${res.status}): ${errorBody}`);
+  }
+
+  const arrayBuffer = await res.arrayBuffer();
+  return Buffer.from(arrayBuffer);
 }
 
 // All top-level node/element types present in Salesforce flow metadata JSON.
@@ -967,6 +995,303 @@ server.tool(
         },
       ],
     };
+  }
+);
+
+// Tool: sf_get_opportunity_files
+server.tool(
+  "sf_get_opportunity_files",
+  "List all files and attachments linked to a Salesforce Opportunity. Returns file name, type, size, and ContentVersionId needed to download the file.",
+  {
+    opportunityId: z
+      .string()
+      .describe("The Salesforce Opportunity ID (e.g. 006aZ000001234QQAQ)"),
+  },
+  async ({ opportunityId }) => {
+    try {
+      const links = await sfRequest(
+        `/query?q=${encodeURIComponent(
+          `SELECT ContentDocumentId, ContentDocument.Title, ContentDocument.FileType, ContentDocument.FileExtension, ContentDocument.ContentSize, ContentDocument.LatestPublishedVersionId, ContentDocument.CreatedDate FROM ContentDocumentLink WHERE LinkedEntityId = '${opportunityId}' ORDER BY ContentDocument.CreatedDate DESC`
+        )}`
+      );
+
+      if (!links.records?.length) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify({
+                opportunityId,
+                totalFiles: 0,
+                files: [],
+                note: "No files found attached to this Opportunity.",
+              }),
+            },
+          ],
+        };
+      }
+
+      const files = links.records.map((r: any) => ({
+        contentDocumentId: r.ContentDocumentId,
+        contentVersionId: r.ContentDocument.LatestPublishedVersionId,
+        title: r.ContentDocument.Title,
+        fileType: r.ContentDocument.FileType,
+        fileExtension: r.ContentDocument.FileExtension,
+        sizeBytes: r.ContentDocument.ContentSize,
+        createdDate: r.ContentDocument.CreatedDate,
+      }));
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(
+              {
+                opportunityId,
+                totalFiles: files.length,
+                files,
+                note: "Use sf_read_file_as_text with a contentVersionId to read file contents.",
+              },
+              null,
+              2
+            ),
+          },
+        ],
+      };
+    } catch (err) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Get opportunity files failed: ${err instanceof Error ? err.message : String(err)}`,
+          },
+        ],
+        isError: true,
+      };
+    }
+  }
+);
+
+// Tool: sf_read_file_as_text
+server.tool(
+  "sf_read_file_as_text",
+  "Download a Salesforce file by ContentVersionId and return its text content. Supports PDF (parsed to text) and plain text files (TXT, CSV, JSON, XML). Use sf_get_opportunity_files first to get the ContentVersionId.",
+  {
+    contentVersionId: z
+      .string()
+      .describe("The ContentVersion ID of the file to read (from sf_get_opportunity_files)"),
+  },
+  async ({ contentVersionId }) => {
+    try {
+      const meta = await sfRequest(
+        `/query?q=${encodeURIComponent(
+          `SELECT Id, Title, FileType, FileExtension, ContentSize FROM ContentVersion WHERE Id = '${contentVersionId}'`
+        )}`
+      );
+
+      if (!meta.records?.length) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `File not found for ContentVersionId: ${contentVersionId}`,
+            },
+          ],
+          isError: true,
+        };
+      }
+
+      const fileMeta = meta.records[0];
+      const fileType = (fileMeta.FileType ?? "").toUpperCase();
+      const fileExtension = (fileMeta.FileExtension ?? "").toLowerCase();
+
+      const buffer = await sfRequestBinary(
+        `/sobjects/ContentVersion/${contentVersionId}/VersionData`
+      );
+
+      let text: string;
+      let parseMethod: string;
+
+      if (fileType === "PDF" || fileExtension === "pdf") {
+        const parser = new PDFParse({ data: buffer });
+        const parsed = await parser.getText();
+        text = parsed.text;
+        parseMethod = "pdf-parse v2";
+      } else if (
+        ["TXT", "CSV", "JSON", "XML", "HTML", "MD"].includes(fileType) ||
+        ["txt", "csv", "json", "xml", "html", "md"].includes(fileExtension)
+      ) {
+        text = buffer.toString("utf-8");
+        parseMethod = "utf-8 text";
+      } else {
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify({
+                contentVersionId,
+                title: fileMeta.Title,
+                fileType,
+                error: `Unsupported file type "${fileType}". Only PDF and plain text formats (TXT, CSV, JSON, XML, HTML) are currently supported.`,
+              }),
+            },
+          ],
+          isError: true,
+        };
+      }
+
+      const cleanedText = text.replace(/\n{3,}/g, "\n\n").trim();
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(
+              {
+                contentVersionId,
+                title: fileMeta.Title,
+                fileType,
+                sizeBytes: fileMeta.ContentSize,
+                parseMethod,
+                characterCount: cleanedText.length,
+                text: cleanedText,
+              },
+              null,
+              2
+            ),
+          },
+        ],
+      };
+    } catch (err) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Read file failed: ${err instanceof Error ? err.message : String(err)}`,
+          },
+        ],
+        isError: true,
+      };
+    }
+  }
+);
+
+// Tool: sf_get_opportunity_details
+server.tool(
+  "sf_get_opportunity_details",
+  "Return full details for a Salesforce Opportunity including core fields (dates, stage, amount) and all line items (products, quantities, prices). Use this alongside sf_read_file_as_text to compare a Sales Order PDF against the actual Opportunity data.",
+  {
+    opportunityId: z
+      .string()
+      .describe("The Salesforce Opportunity ID (e.g. 006aZ000001234QQAQ)"),
+  },
+  async ({ opportunityId }) => {
+    try {
+      const oppData = await sfRequest(
+        `/query?q=${encodeURIComponent(
+          `SELECT Id, Name, StageName, Amount, CloseDate, Type, LeadSource, Description, OwnerId, Owner.Name, AccountId, Account.Name, CreatedDate, LastModifiedDate FROM Opportunity WHERE Id = '${opportunityId}'`
+        )}`
+      );
+
+      if (!oppData.records?.length) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `No Opportunity found with Id: ${opportunityId}`,
+            },
+          ],
+          isError: true,
+        };
+      }
+
+      const opp = oppData.records[0];
+
+      const lineItemData = await sfRequest(
+        `/query?q=${encodeURIComponent(
+          `SELECT Id, Name, Product2Id, Product2.Name, ProductCode, Quantity, UnitPrice, TotalPrice, Discount, ServiceDate, Description FROM OpportunityLineItem WHERE OpportunityId = '${opportunityId}' ORDER BY CreatedDate ASC`
+        )}`
+      );
+
+      const lineItems = (lineItemData.records ?? []).map((li: any) => ({
+        id: li.Id,
+        name: li.Name,
+        productName: li.Product2?.Name ?? null,
+        productCode: li.ProductCode ?? null,
+        quantity: li.Quantity,
+        unitPrice: li.UnitPrice,
+        totalPrice: li.TotalPrice,
+        discount: li.Discount ?? null,
+        serviceDate: li.ServiceDate ?? null,
+        description: li.Description ?? null,
+      }));
+
+      // Try common contract/opt-out custom fields — fails gracefully if they don't exist
+      let contractFields: Record<string, any> = {};
+      try {
+        const contractData = await sfRequest(
+          `/query?q=${encodeURIComponent(
+            `SELECT Contract_Start_Date__c, Contract_End_Date__c, Opt_Out_Period__c, Opt_Out_Date__c FROM Opportunity WHERE Id = '${opportunityId}'`
+          )}`
+        );
+        if (contractData.records?.length) {
+          const r = contractData.records[0];
+          contractFields = {
+            contractStartDate: r.Contract_Start_Date__c ?? null,
+            contractEndDate: r.Contract_End_Date__c ?? null,
+            optOutPeriod: r.Opt_Out_Period__c ?? null,
+            optOutDate: r.Opt_Out_Date__c ?? null,
+          };
+        }
+      } catch {
+        contractFields = {
+          contractFieldsNote:
+            "Common contract/opt-out custom fields not found in this org. Run sf_describe on Opportunity to find your org-specific field names, then use sf_query to fetch them.",
+        };
+      }
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(
+              {
+                opportunity: {
+                  id: opp.Id,
+                  name: opp.Name,
+                  stage: opp.StageName,
+                  amount: opp.Amount,
+                  closeDate: opp.CloseDate,
+                  type: opp.Type ?? null,
+                  owner: opp.Owner?.Name ?? null,
+                  account: opp.Account?.Name ?? null,
+                  createdDate: opp.CreatedDate,
+                  lastModifiedDate: opp.LastModifiedDate,
+                  description: opp.Description ?? null,
+                  ...contractFields,
+                },
+                lineItems: {
+                  totalCount: lineItems.length,
+                  items: lineItems,
+                },
+              },
+              null,
+              2
+            ),
+          },
+        ],
+      };
+    } catch (err) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Get opportunity details failed: ${err instanceof Error ? err.message : String(err)}`,
+          },
+        ],
+        isError: true,
+      };
+    }
   }
 );
 
