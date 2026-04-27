@@ -1295,6 +1295,223 @@ server.tool(
   }
 );
 
+// Tool: sf_scan_opportunity_pdfs
+server.tool(
+  "sf_scan_opportunity_pdfs",
+  "Scan PDF attachments across multiple Opportunities to find specific terms (e.g. 'opt-out', 'termination') or check for product mismatches against Opportunity Line Items. Returns a summary per opportunity. Use a SOQL WHERE clause to filter opportunities (e.g. \"StageName = 'Closed Won' AND CloseDate = THIS_YEAR\").",
+  {
+    opportunityFilter: z
+      .string()
+      .describe(
+        "SOQL WHERE clause to filter Opportunities, e.g. \"StageName = 'Closed Won' AND CloseDate = THIS_YEAR\""
+      ),
+    searchTerms: z
+      .array(z.string())
+      .optional()
+      .describe(
+        "Terms to search for in each PDF, e.g. ['opt-out', 'termination', 'cancellation']. If omitted, only metadata and product mismatches are returned."
+      ),
+    checkProductMatch: z
+      .boolean()
+      .optional()
+      .describe(
+        "If true, compare products found in the PDF text against the Opportunity Line Items and flag mismatches. Defaults to false."
+      ),
+    maxOpportunities: z
+      .number()
+      .int()
+      .min(1)
+      .max(50)
+      .optional()
+      .describe("Max number of Opportunities to scan. Defaults to 20, max 50."),
+  },
+  async ({ opportunityFilter, searchTerms = [], checkProductMatch = false, maxOpportunities = 20 }) => {
+    try {
+      // 1. Fetch matching opportunities
+      const oppData = await sfRequest(
+        `/query?q=${encodeURIComponent(
+          `SELECT Id, Name, StageName, Amount, CloseDate, Account.Name FROM Opportunity WHERE ${opportunityFilter} ORDER BY CloseDate DESC LIMIT ${maxOpportunities}`
+        )}`
+      );
+
+      const opps: any[] = oppData.records ?? [];
+      if (opps.length === 0) {
+        return {
+          content: [{ type: "text", text: JSON.stringify({ message: "No opportunities matched the filter.", results: [] }, null, 2) }],
+        };
+      }
+
+      const oppIds = opps.map((o: any) => `'${o.Id}'`).join(", ");
+
+      // 2. Fetch all ContentDocumentLinks for these opportunities in one query
+      const linkData = await sfRequest(
+        `/query?q=${encodeURIComponent(
+          `SELECT ContentDocumentId, LinkedEntityId FROM ContentDocumentLink WHERE LinkedEntityId IN (${oppIds})`
+        )}`
+      );
+      const links: any[] = linkData.records ?? [];
+
+      // Build map: opportunityId → [ContentDocumentId]
+      const oppToDocIds: Record<string, string[]> = {};
+      for (const link of links) {
+        if (!oppToDocIds[link.LinkedEntityId]) oppToDocIds[link.LinkedEntityId] = [];
+        oppToDocIds[link.LinkedEntityId].push(link.ContentDocumentId);
+      }
+
+      const allDocIds = links.map((l: any) => `'${l.ContentDocumentId}'`).join(", ");
+
+      // 3. Fetch ContentVersion metadata for all PDFs in one query
+      let versionMap: Record<string, any[]> = {};
+      if (allDocIds.length > 0) {
+        const versionData = await sfRequest(
+          `/query?q=${encodeURIComponent(
+            `SELECT Id, Title, FileType, ContentDocumentId, ContentSize FROM ContentVersion WHERE ContentDocumentId IN (${allDocIds}) AND FileType = 'PDF' AND IsLatest = true`
+          )}`
+        );
+        for (const v of versionData.records ?? []) {
+          if (!versionMap[v.ContentDocumentId]) versionMap[v.ContentDocumentId] = [];
+          versionMap[v.ContentDocumentId].push(v);
+        }
+      }
+
+      // 4. Fetch line items for all opportunities in one query (for product mismatch check)
+      let lineItemsByOpp: Record<string, string[]> = {};
+      if (checkProductMatch) {
+        const liData = await sfRequest(
+          `/query?q=${encodeURIComponent(
+            `SELECT OpportunityId, Product2.Name FROM OpportunityLineItem WHERE OpportunityId IN (${oppIds})`
+          )}`
+        );
+        for (const li of liData.records ?? []) {
+          if (!lineItemsByOpp[li.OpportunityId]) lineItemsByOpp[li.OpportunityId] = [];
+          if (li.Product2?.Name) lineItemsByOpp[li.OpportunityId].push(li.Product2.Name);
+        }
+      }
+
+      // 5. For each opportunity, download and parse its PDFs in parallel
+      const results = await Promise.all(
+        opps.map(async (opp: any) => {
+          const docIds = oppToDocIds[opp.Id] ?? [];
+          const pdfVersions = docIds.flatMap((docId) => versionMap[docId] ?? []);
+
+          if (pdfVersions.length === 0) {
+            return {
+              opportunityId: opp.Id,
+              opportunityName: opp.Name,
+              account: opp.Account?.Name ?? null,
+              closeDate: opp.CloseDate,
+              amount: opp.Amount,
+              pdfsFound: 0,
+              pdfs: [],
+            };
+          }
+
+          const pdfResults = await Promise.all(
+            pdfVersions.map(async (version: any) => {
+              try {
+                const buffer = await sfRequestBinary(`/sobjects/ContentVersion/${version.Id}/VersionData`);
+                const parser = new PDFParse({ data: buffer });
+                const parsed = await parser.getText();
+                const text = parsed.text.replace(/\n{3,}/g, "\n\n").trim();
+
+                // Search for terms
+                const termMatches: Record<string, boolean> = {};
+                for (const term of searchTerms) {
+                  termMatches[term] = text.toLowerCase().includes(term.toLowerCase());
+                }
+
+                // Product mismatch check
+                let productMismatch: { lineItemProducts: string[]; missingFromPdf: string[]; note: string } | null = null;
+                if (checkProductMatch) {
+                  const lineItemProducts = lineItemsByOpp[opp.Id] ?? [];
+                  const missingFromPdf = lineItemProducts.filter(
+                    (p) => !text.toLowerCase().includes(p.toLowerCase())
+                  );
+                  productMismatch = {
+                    lineItemProducts,
+                    missingFromPdf,
+                    note: missingFromPdf.length > 0
+                      ? `${missingFromPdf.length} product(s) on the opportunity not found in PDF text`
+                      : "All opportunity products appear in PDF",
+                  };
+                }
+
+                return {
+                  contentVersionId: version.Id,
+                  title: version.Title,
+                  sizeBytes: version.ContentSize,
+                  termMatches: searchTerms.length > 0 ? termMatches : undefined,
+                  anyTermMatched: searchTerms.length > 0 ? Object.values(termMatches).some(Boolean) : undefined,
+                  productMismatch: checkProductMatch ? productMismatch : undefined,
+                  parseError: null,
+                };
+              } catch (err) {
+                return {
+                  contentVersionId: version.Id,
+                  title: version.Title,
+                  sizeBytes: version.ContentSize,
+                  termMatches: null,
+                  anyTermMatched: null,
+                  productMismatch: null,
+                  parseError: err instanceof Error ? err.message : String(err),
+                };
+              }
+            })
+          );
+
+          const anyMatch = pdfResults.some((p) => p.anyTermMatched);
+          const hasProductMismatch = pdfResults.some(
+            (p) => p.productMismatch && p.productMismatch.missingFromPdf.length > 0
+          );
+
+          return {
+            opportunityId: opp.Id,
+            opportunityName: opp.Name,
+            account: opp.Account?.Name ?? null,
+            closeDate: opp.CloseDate,
+            amount: opp.Amount,
+            pdfsFound: pdfVersions.length,
+            anyTermMatched: searchTerms.length > 0 ? anyMatch : undefined,
+            hasProductMismatch: checkProductMatch ? hasProductMismatch : undefined,
+            pdfs: pdfResults,
+          };
+        })
+      );
+
+      const summary = {
+        opportunitiesScanned: opps.length,
+        opportunitiesWithPdfs: results.filter((r) => r.pdfsFound > 0).length,
+        ...(searchTerms.length > 0 && {
+          opportunitiesWithTermMatches: results.filter((r) => r.anyTermMatched).length,
+          searchTerms,
+        }),
+        ...(checkProductMatch && {
+          opportunitiesWithProductMismatches: results.filter((r) => r.hasProductMismatch).length,
+        }),
+      };
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify({ summary, results }, null, 2),
+          },
+        ],
+      };
+    } catch (err) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Scan failed: ${err instanceof Error ? err.message : String(err)}`,
+          },
+        ],
+        isError: true,
+      };
+    }
+  }
+);
+
 // Start server
 async function main() {
   const transport = new StdioServerTransport();
