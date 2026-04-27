@@ -138,6 +138,62 @@ function extractSnippets(text: string, terms: string[], contextChars = 120): str
   return snippets;
 }
 
+// All top-level node/element types present in Salesforce flow metadata JSON.
+const FLOW_NODE_TYPES = [
+  "decisions",
+  "assignments",
+  "recordUpdates",
+  "recordLookups",
+  "recordCreates",
+  "recordDeletes",
+  "subflows",
+  "actionCalls",
+  "apexPluginCalls",
+  "loops",
+  "screens",
+  "waits",
+  "customErrors",
+  "formulas",
+  "variables",
+  "constants",
+  "textTemplates",
+] as const;
+
+interface FlowNodeMatch {
+  nodeApiName: string;
+  nodeLabel: string | null;
+  nodeType: string;
+  matchedTerms: string[];
+}
+
+// Searches a flow's Metadata object at the node level. Returns one entry per
+// node that contains at least one search term, with the node's API name, label,
+// and type — so callers know exactly which node to open in Flow Builder.
+function extractMatchingNodes(metadata: any, terms: string[]): FlowNodeMatch[] {
+  const matches: FlowNodeMatch[] = [];
+
+  for (const nodeType of FLOW_NODE_TYPES) {
+    const nodes = metadata[nodeType];
+    if (!Array.isArray(nodes)) continue;
+
+    for (const node of nodes) {
+      const nodeStr = JSON.stringify(node).toLowerCase();
+      const matchedTerms = terms.filter((t) => nodeStr.includes(t.toLowerCase()));
+
+      if (matchedTerms.length > 0) {
+        matches.push({
+          nodeApiName: node.name ?? node.apiName ?? "(unnamed)",
+          nodeLabel: node.label ?? null,
+          nodeType,
+          matchedTerms,
+        });
+      }
+    }
+  }
+
+  return matches;
+}
+
 // Create MCP server
 const server = new McpServer({
   name: "salesforce-query-mcp",
@@ -533,7 +589,7 @@ server.tool(
 
       const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")} ` : "";
 
-      const soql = `SELECT Id, MasterLabel, Status, ProcessType, VersionNumber, Description FROM Flow ${whereClause}ORDER BY Status ASC, MasterLabel ASC LIMIT 200`;
+      const soql = `SELECT Id, MasterLabel, Status, ProcessType, VersionNumber, Description FROM Flow ${whereClause}ORDER BY Status ASC, MasterLabel ASC LIMIT 2000`;
 
       const flows = await sfToolingQueryPaginated(soql);
 
@@ -598,7 +654,7 @@ server.tool(
   async ({ searchTerms, activeOnly = true }) => {
     try {
       const statusFilter = activeOnly ? "WHERE Status = 'Active' " : "";
-      const soql = `SELECT Id, MasterLabel, Status, ProcessType, VersionNumber, Description FROM Flow ${statusFilter}ORDER BY MasterLabel ASC LIMIT 200`;
+      const soql = `SELECT Id, MasterLabel, Status, ProcessType, VersionNumber, Description FROM Flow ${statusFilter}ORDER BY MasterLabel ASC LIMIT 2000`;
 
       const flows = await sfToolingQueryPaginated(soql);
 
@@ -627,18 +683,13 @@ server.tool(
             surfaceText.toLowerCase().includes(t.toLowerCase())
           );
 
-          let deepMatches: string[] = [];
-          let deepSnippets: string[] = [];
+          let matchingNodes: FlowNodeMatch[] = [];
           let metadataNote: string | null = null;
 
           try {
             const detail = await sfToolingRecord("Flow", flow.Id);
             if (detail.Metadata) {
-              const metaStr = JSON.stringify(detail.Metadata);
-              deepMatches = searchTerms.filter((t) =>
-                metaStr.toLowerCase().includes(t.toLowerCase())
-              );
-              deepSnippets = extractSnippets(metaStr, deepMatches, 150);
+              matchingNodes = extractMatchingNodes(detail.Metadata, searchTerms);
             } else {
               metadataNote = "Metadata field was null or unavailable for this flow";
             }
@@ -646,13 +697,14 @@ server.tool(
             metadataNote = "Failed to retrieve flow metadata";
           }
 
-          return { flow, surfaceMatches, deepMatches, deepSnippets, metadataNote };
+          const deepMatches = [...new Set(matchingNodes.flatMap((n) => n.matchedTerms))];
+          return { flow, surfaceMatches, deepMatches, matchingNodes, metadataNote };
         })
       );
 
       const matches: any[] = [];
 
-      for (const { flow, surfaceMatches, deepMatches, deepSnippets, metadataNote } of results) {
+      for (const { flow, surfaceMatches, deepMatches, matchingNodes, metadataNote } of results) {
         const allMatchedTerms = [...new Set([...surfaceMatches, ...deepMatches])];
         if (allMatchedTerms.length > 0) {
           matches.push({
@@ -664,8 +716,7 @@ server.tool(
             description: flow.Description ?? null,
             matchedTerms: allMatchedTerms,
             surfaceMatch: surfaceMatches.length > 0,
-            metadataMatch: deepMatches.length > 0,
-            snippets: deepSnippets,
+            matchingNodes,
             metadataNote,
           });
         }
@@ -791,7 +842,7 @@ server.tool(
 
     // Flow Search
     try {
-      const soql = `SELECT Id, MasterLabel, Status, ProcessType, VersionNumber, Description FROM Flow WHERE Status = 'Active' ORDER BY MasterLabel ASC LIMIT 200`;
+      const soql = `SELECT Id, MasterLabel, Status, ProcessType, VersionNumber, Description FROM Flow WHERE Status = 'Active' ORDER BY MasterLabel ASC LIMIT 2000`;
       const flows = await sfToolingQueryPaginated(soql);
 
       const flowResults = await Promise.all(
@@ -803,18 +854,13 @@ server.tool(
             surfaceText.toLowerCase().includes(t.toLowerCase())
           );
 
-          let deepMatches: string[] = [];
-          let deepSnippets: string[] = [];
+          let matchingNodes: FlowNodeMatch[] = [];
           let metadataNote: string | null = null;
 
           try {
             const detail = await sfToolingRecord("Flow", flow.Id);
             if (detail.Metadata) {
-              const metaStr = JSON.stringify(detail.Metadata);
-              deepMatches = searchTerms.filter((t) =>
-                metaStr.toLowerCase().includes(t.toLowerCase())
-              );
-              deepSnippets = extractSnippets(metaStr, deepMatches, 150);
+              matchingNodes = extractMatchingNodes(detail.Metadata, searchTerms);
             } else {
               metadataNote = "Metadata unavailable for this flow";
             }
@@ -822,11 +868,12 @@ server.tool(
             metadataNote = "Failed to retrieve flow metadata";
           }
 
-          return { flow, surfaceMatches, deepMatches, deepSnippets, metadataNote };
+          const deepMatches = [...new Set(matchingNodes.flatMap((n) => n.matchedTerms))];
+          return { flow, surfaceMatches, deepMatches, matchingNodes, metadataNote };
         })
       );
 
-      for (const { flow, surfaceMatches, deepMatches, deepSnippets, metadataNote } of flowResults) {
+      for (const { flow, surfaceMatches, deepMatches, matchingNodes, metadataNote } of flowResults) {
         const allMatchedTerms = [...new Set([...surfaceMatches, ...deepMatches])];
         if (allMatchedTerms.length > 0) {
           flowMatches.push({
@@ -836,7 +883,7 @@ server.tool(
             status: flow.Status,
             version: flow.VersionNumber,
             matchedTerms: allMatchedTerms,
-            snippets: deepSnippets,
+            matchingNodes,
             metadataNote,
           });
         }
@@ -857,7 +904,7 @@ server.tool(
       "Process Builder automations use ProcessType = 'Workflow' — run sf_get_flows with processType='Workflow' to review them separately."
     );
     limitations.push(
-      "Flow search is limited to 200 active flows per query. If your org has more than 200 active flows, add processType filters to narrow the scope."
+      "Flow search is limited to 2000 active flows per query. If your org exceeds this, add processType filters to narrow the scope."
     );
 
     // Recommended Next Steps
