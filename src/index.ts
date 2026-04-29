@@ -13,6 +13,7 @@ const CLIENT_ID = process.env.SALESFORCE_CID;
 const CLIENT_SECRET = process.env.SALESFORCE_CS;
 const REFRESH_TOKEN = process.env.SALESFORCE_REFRESH_TOKEN;
 const LOGIN_URL = process.env.SALESFORCE_LOGIN_URL || "https://login.salesforce.com";
+const MAX_FILE_BYTES = 30 * 1024 * 1024; // 30 MB
 
 if (!CLIENT_ID || !CLIENT_SECRET || !REFRESH_TOKEN) {
   console.error("Error: SALESFORCE_CID, SALESFORCE_CS, and SALESFORCE_REFRESH_TOKEN environment variables are required");
@@ -166,8 +167,30 @@ async function sfRequestBinary(path: string): Promise<Buffer> {
   return Buffer.from(arrayBuffer);
 }
 
+// Runs tasks with a max concurrency limit to avoid overwhelming the API or exhausting memory.
+async function runWithConcurrency<T>(
+  tasks: (() => Promise<T>)[],
+  concurrency: number
+): Promise<T[]> {
+  const results: T[] = new Array(tasks.length);
+  let next = 0;
+  async function worker() {
+    while (next < tasks.length) {
+      const i = next++;
+      results[i] = await tasks[i]();
+    }
+  }
+  await Promise.all(
+    Array.from({ length: Math.min(concurrency, tasks.length) }, worker)
+  );
+  return results;
+}
+
 // All top-level node/element types present in Salesforce flow metadata JSON.
+// "start" is included because record-triggered flows store their object/filter
+// conditions there — omitting it would silently miss those references.
 const FLOW_NODE_TYPES = [
+  "start",
   "decisions",
   "assignments",
   "recordUpdates",
@@ -583,7 +606,7 @@ server.tool(
   "List Salesforce flows via the Tooling API. Optionally filter by status, process type, or active-only. Returns up to 200 flows ordered by status then label.",
   {
     status: z
-      .string()
+      .enum(["Active", "Draft", "Obsolete", "InvalidDraft"])
       .optional()
       .describe(
         'Filter by flow Status: "Active", "Draft", "Obsolete", "InvalidDraft". Omit for all statuses.'
@@ -605,10 +628,17 @@ server.tool(
     try {
       const conditions: string[] = [];
 
+      const FLOW_STATUS_MAP = {
+        Active: "Active",
+        Draft: "Draft",
+        Obsolete: "Obsolete",
+        InvalidDraft: "InvalidDraft",
+      } as const;
+
       if (activeOnly) {
         conditions.push("Status = 'Active'");
       } else if (status) {
-        conditions.push(`Status = '${status}'`);
+        conditions.push(`Status = '${FLOW_STATUS_MAP[status]}'`);
       }
 
       if (processType) {
@@ -702,8 +732,8 @@ server.tool(
         };
       }
 
-      const results = await Promise.all(
-        flows.map(async (flow) => {
+      const results = await runWithConcurrency(
+        flows.map((flow) => async () => {
           const surfaceText = [flow.MasterLabel, flow.Description, flow.ProcessType]
             .filter(Boolean)
             .join(" ");
@@ -727,7 +757,8 @@ server.tool(
 
           const deepMatches = [...new Set(matchingNodes.flatMap((n) => n.matchedTerms))];
           return { flow, surfaceMatches, deepMatches, matchingNodes, metadataNote };
-        })
+        }),
+        10
       );
 
       const matches: any[] = [];
@@ -873,8 +904,8 @@ server.tool(
       const soql = `SELECT Id, MasterLabel, Status, ProcessType, VersionNumber, Description FROM Flow WHERE Status = 'Active' ORDER BY MasterLabel ASC LIMIT 2000`;
       const flows = await sfToolingQueryPaginated(soql);
 
-      const flowResults = await Promise.all(
-        flows.map(async (flow) => {
+      const flowResults = await runWithConcurrency(
+        flows.map((flow) => async () => {
           const surfaceText = [flow.MasterLabel, flow.Description, flow.ProcessType]
             .filter(Boolean)
             .join(" ");
@@ -898,7 +929,8 @@ server.tool(
 
           const deepMatches = [...new Set(matchingNodes.flatMap((n) => n.matchedTerms))];
           return { flow, surfaceMatches, deepMatches, matchingNodes, metadataNote };
-        })
+        }),
+        10
       );
 
       for (const { flow, surfaceMatches, deepMatches, matchingNodes, metadataNote } of flowResults) {
@@ -1105,6 +1137,23 @@ server.tool(
       const fileType = (fileMeta.FileType ?? "").toUpperCase();
       const fileExtension = (fileMeta.FileExtension ?? "").toLowerCase();
 
+      if (fileMeta.ContentSize > MAX_FILE_BYTES) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify({
+                contentVersionId,
+                title: fileMeta.Title,
+                sizeBytes: fileMeta.ContentSize,
+                error: `File is too large to download (${(fileMeta.ContentSize / 1024 / 1024).toFixed(1)} MB). Limit is 30 MB.`,
+              }),
+            },
+          ],
+          isError: true,
+        };
+      }
+
       const buffer = await sfRequestBinary(
         `/sobjects/ContentVersion/${contentVersionId}/VersionData`
       );
@@ -1226,28 +1275,30 @@ server.tool(
         description: li.Description ?? null,
       }));
 
-      // Try common contract/opt-out custom fields — fails gracefully if they don't exist
-      let contractFields: Record<string, any> = {};
-      try {
-        const contractData = await sfRequest(
-          `/query?q=${encodeURIComponent(
-            `SELECT Contract_Start_Date__c, Contract_End_Date__c, Opt_Out_Period__c, Opt_Out_Date__c FROM Opportunity WHERE Id = '${opportunityId}'`
-          )}`
-        );
-        if (contractData.records?.length) {
-          const r = contractData.records[0];
-          contractFields = {
-            contractStartDate: r.Contract_Start_Date__c ?? null,
-            contractEndDate: r.Contract_End_Date__c ?? null,
-            optOutPeriod: r.Opt_Out_Period__c ?? null,
-            optOutDate: r.Opt_Out_Date__c ?? null,
-          };
+      // Try common contract/opt-out custom fields one at a time so a missing
+      // field doesn't fail the entire query.
+      const CONTRACT_FIELDS: Array<{ field: string; key: string }> = [
+        { field: "Contract_Start_Date__c", key: "contractStartDate" },
+        { field: "Contract_End_Date__c", key: "contractEndDate" },
+        { field: "Opt_Out_Period__c", key: "optOutPeriod" },
+        { field: "Opt_Out_Date__c", key: "optOutDate" },
+      ];
+      const contractFields: Record<string, any> = {};
+      for (const { field, key } of CONTRACT_FIELDS) {
+        try {
+          const r = await sfRequest(
+            `/query?q=${encodeURIComponent(
+              `SELECT ${field} FROM Opportunity WHERE Id = '${opportunityId}'`
+            )}`
+          );
+          contractFields[key] = r.records?.[0]?.[field] ?? null;
+        } catch {
+          // Field doesn't exist in this org — skip silently
         }
-      } catch {
-        contractFields = {
-          contractFieldsNote:
-            "Common contract/opt-out custom fields not found in this org. Run sf_describe on Opportunity to find your org-specific field names, then use sf_query to fetch them.",
-        };
+      }
+      if (Object.keys(contractFields).length === 0) {
+        contractFields.contractFieldsNote =
+          "No common contract/opt-out custom fields found in this org. Run sf_describe on Opportunity to find org-specific field names.";
       }
 
       return {
@@ -1388,9 +1439,12 @@ server.tool(
         }
       }
 
-      // 5. For each opportunity, download and parse its PDFs in parallel
-      const results = await Promise.all(
-        opps.map(async (opp: any) => {
+      const SCAN_MAX_FILE_BYTES = 30 * 1024 * 1024; // 30 MB per file
+
+      // 5. For each opportunity, download and parse its PDFs — capped at 5 concurrent opps,
+      //    and 3 concurrent PDF downloads per opp to avoid OOM on large attachments.
+      const results = await runWithConcurrency(
+        opps.map((opp: any) => async () => {
           const docIds = oppToDocIds[opp.Id] ?? [];
           const pdfVersions = docIds.flatMap((docId) => versionMap[docId] ?? []);
 
@@ -1406,9 +1460,20 @@ server.tool(
             };
           }
 
-          const pdfResults = await Promise.all(
-            pdfVersions.map(async (version: any) => {
+          const pdfResults = await runWithConcurrency(
+            pdfVersions.map((version: any) => async () => {
               try {
+                if (version.ContentSize > SCAN_MAX_FILE_BYTES) {
+                  return {
+                    contentVersionId: version.Id,
+                    title: version.Title,
+                    sizeBytes: version.ContentSize,
+                    termMatches: null,
+                    anyTermMatched: null,
+                    productMismatch: null,
+                    parseError: `File too large to scan (${(version.ContentSize / 1024 / 1024).toFixed(1)} MB, limit 30 MB)`,
+                  };
+                }
                 const buffer = await sfRequestBinary(`/sobjects/ContentVersion/${version.Id}/VersionData`);
                 const parser = new PDFParse({ data: buffer });
                 const parsed = await parser.getText();
@@ -1456,7 +1521,8 @@ server.tool(
                   parseError: err instanceof Error ? err.message : String(err),
                 };
               }
-            })
+            }),
+            3
           );
 
           const anyMatch = pdfResults.some((p) => p.anyTermMatched);
@@ -1475,7 +1541,8 @@ server.tool(
             hasProductMismatch: checkProductMatch ? hasProductMismatch : undefined,
             pdfs: pdfResults,
           };
-        })
+        }),
+        5
       );
 
       const summary = {
