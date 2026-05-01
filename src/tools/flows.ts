@@ -426,6 +426,11 @@ export function registerFlowTools(
         );
       }
 
+      if (value) {
+        recommendedNextSteps.push(
+          `Run sf_get_record_type_picklists on ${objectApiName}, field ${fieldApiName}, filterValue "${value}" to see which record types have this value active — removing it will affect those record types.`
+        );
+      }
       recommendedNextSteps.push(
         `Run: sf_tooling_query with "SELECT Id, Name, Body FROM ApexClass" and search results for "${fieldApiName}"${value ? ` and "${value}"` : ""} to check Apex.`
       );

@@ -8,6 +8,7 @@ import { registerValidationTools } from "./tools/validation.js";
 import { registerFlowTools } from "./tools/flows.js";
 import { registerFileTools } from "./tools/files.js";
 import { registerOpportunityTools } from "./tools/opportunity.js";
+import { registerMetadataTools } from "./tools/metadata.js";
 
 // Auth client
 const client = new SalesforceClient();
@@ -24,6 +25,7 @@ registerValidationTools(server, client);
 registerFlowTools(server, client);
 registerFileTools(server, client);
 registerOpportunityTools(server, client);
+registerMetadataTools(server, client);
 
 // Start server
 async function main() {
