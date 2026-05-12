@@ -1,3 +1,4 @@
+import "dotenv/config";
 import { App, ExpressReceiver, LogLevel } from "@slack/bolt";
 import { runClaudeLoop, Message } from "./claude.js";
 
