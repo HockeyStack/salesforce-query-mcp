@@ -65,29 +65,38 @@ async function startHttp() {
     if (!checkAuth(req, res)) return;
 
     const isInit = req.body?.method === "initialize";
-    const sessionId: string = isInit
-      ? uuidv4()
-      : (req.headers["mcp-session-id"] as string);
 
-    if (!sessionId) {
-      res.status(400).json({ error: "Missing Mcp-Session-Id header" });
-      return;
-    }
-
-    if (!sessions[sessionId]) {
+    if (isInit) {
+      const sessionId = uuidv4();
       const transport = new StreamableHTTPServerTransport({
         sessionIdGenerator: () => sessionId,
-        onsessioninitialized: (id) => {
-          sessions[id] = transport;
-        },
       });
+      sessions[sessionId] = transport;
       transport.onclose = () => {
         delete sessions[sessionId];
       };
-      await server.connect(transport);
+      try {
+        await server.connect(transport);
+        await transport.handleRequest(req, res, req.body);
+      } catch (err) {
+        console.error("MCP init error:", err);
+        if (!res.headersSent) res.status(500).json({ error: "Internal server error" });
+      }
+      return;
     }
 
-    await sessions[sessionId]?.handleRequest(req, res, req.body);
+    const sessionId = req.headers["mcp-session-id"] as string;
+    if (!sessionId || !sessions[sessionId]) {
+      res.status(400).json({ error: "Missing or unknown session" });
+      return;
+    }
+
+    try {
+      await sessions[sessionId].handleRequest(req, res, req.body);
+    } catch (err) {
+      console.error("MCP request error:", err);
+      if (!res.headersSent) res.status(500).json({ error: "Internal server error" });
+    }
   });
 
   // MCP: SSE stream (for clients that open a persistent GET)
