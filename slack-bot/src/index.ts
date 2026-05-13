@@ -96,6 +96,6 @@ app.error(async (error) => {
 });
 
 (async () => {
-  await app.start();
+  await app.start(SLACK_PORT);
   console.log(`Salesforce MCP Slack bot running on port ${SLACK_PORT}`);
 })();
