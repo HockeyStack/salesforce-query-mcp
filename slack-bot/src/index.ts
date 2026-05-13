@@ -1,5 +1,6 @@
 import "dotenv/config";
 import { App, ExpressReceiver, LogLevel } from "@slack/bolt";
+import type { SayFn } from "@slack/bolt";
 import { runClaudeLoop, Message } from "./claude.js";
 
 const SLACK_PORT = parseInt(process.env.SLACK_PORT ?? "3000", 10);
@@ -40,15 +41,10 @@ function appendHistory(threadTs: string, role: "user" | "assistant", content: st
 
 async function handleMessage(
   text: string,
-  channelId: string,
   threadTs: string,
-  say: Function
+  say: SayFn
 ) {
-  // Post a placeholder so users know the bot is working
-  const thinkingMsg = await say({
-    text: "_Thinking..._",
-    thread_ts: threadTs,
-  });
+  await say({ text: "_Thinking..._", thread_ts: threadTs });
 
   try {
     const history = getHistory(threadTs);
@@ -57,38 +53,29 @@ async function handleMessage(
     appendHistory(threadTs, "user", text);
     appendHistory(threadTs, "assistant", reply);
 
-    await app.client.chat.update({
-      channel: channelId,
-      ts: thinkingMsg.ts as string,
-      text: reply,
-    });
+    await say({ text: reply, thread_ts: threadTs });
   } catch (err) {
     const errMsg = err instanceof Error ? err.message : String(err);
     console.error("handleMessage error:", errMsg);
-    await app.client.chat.update({
-      channel: channelId,
-      ts: thinkingMsg.ts as string,
-      text: `:warning: Something went wrong: ${errMsg}`,
-    });
+    await say({ text: `Something went wrong: ${errMsg}`, thread_ts: threadTs });
   }
 }
 
-// Channel mentions: @SalesforceMCP what is ...
+// Channel mentions: @RevopsMCP what is ...
 app.event("app_mention", async ({ event, say }) => {
-  // Strip the @mention tag from the message text
   const text = event.text.replace(/<@[A-Z0-9]+>/g, "").trim();
   if (!text) return;
   const threadTs = event.thread_ts ?? event.ts;
-  await handleMessage(text, event.channel, threadTs, say);
+  // Don't await - return immediately so Bolt acks the event before Slack's 3s retry window
+  handleMessage(text, threadTs, say).catch(console.error);
 });
 
 // Direct messages: no @mention needed
 app.message(async ({ message, say }) => {
   const msg = message as any;
-  // Ignore subtypes (edits, deletes, bot messages, etc.)
   if (msg.subtype || msg.bot_id || !msg.text) return;
   const threadTs = msg.thread_ts ?? msg.ts;
-  await handleMessage(msg.text, msg.channel, threadTs, say);
+  handleMessage(msg.text, threadTs, say).catch(console.error);
 });
 
 app.error(async (error) => {
