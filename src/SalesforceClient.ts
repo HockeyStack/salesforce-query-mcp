@@ -65,6 +65,33 @@ export class SalesforceClient {
   }
 
   /**
+   * Fetches a Salesforce API path with a single 401-refresh-and-retry.
+   * Shared by request() and requestBinary() to avoid duplicating the auth loop.
+   */
+  private async fetchWithRetry(path: string): Promise<Response> {
+    await this.ensureToken();
+    const url = `${this.instanceUrl}/services/data/${API_VERSION}${path}`;
+
+    let res = await fetch(url, {
+      headers: { Authorization: `Bearer ${this.accessToken}` },
+    });
+
+    if (res.status === 401) {
+      await this.refreshAccessToken();
+      res = await fetch(url, {
+        headers: { Authorization: `Bearer ${this.accessToken}` },
+      });
+    }
+
+    if (!res.ok) {
+      const errorBody = await res.text();
+      throw new Error(`Salesforce API error (${res.status}): ${errorBody}`);
+    }
+
+    return res;
+  }
+
+  /**
    * Makes a JSON request to the Salesforce data or Tooling API.
    * Pass paths relative to /services/data/vXX.0/, e.g.:
    *   /query?q=...              → standard data API
@@ -72,57 +99,24 @@ export class SalesforceClient {
    *   /tooling/sobjects/Foo/id  → Tooling API record fetch
    */
   async request(path: string): Promise<any> {
-    await this.ensureToken();
-    const url = `${this.instanceUrl}/services/data/${API_VERSION}${path}`;
-
-    let res = await fetch(url, {
-      headers: { Authorization: `Bearer ${this.accessToken}` },
-    });
-
-    if (res.status === 401) {
-      await this.refreshAccessToken();
-      res = await fetch(url, {
-        headers: { Authorization: `Bearer ${this.accessToken}` },
-      });
-    }
-
-    if (!res.ok) {
-      const errorBody = await res.text();
-      throw new Error(`Salesforce API error (${res.status}): ${errorBody}`);
-    }
-
+    const res = await this.fetchWithRetry(path);
     return res.json();
   }
 
   /** Downloads binary content (e.g. ContentVersion file data) and returns a Buffer. */
   async requestBinary(path: string): Promise<Buffer> {
-    await this.ensureToken();
-    const url = `${this.instanceUrl}/services/data/${API_VERSION}${path}`;
-
-    let res = await fetch(url, {
-      headers: { Authorization: `Bearer ${this.accessToken}` },
-    });
-
-    if (res.status === 401) {
-      await this.refreshAccessToken();
-      res = await fetch(url, {
-        headers: { Authorization: `Bearer ${this.accessToken}` },
-      });
-    }
-
-    if (!res.ok) {
-      const errorBody = await res.text();
-      throw new Error(`Salesforce API error (${res.status}): ${errorBody}`);
-    }
-
+    const res = await this.fetchWithRetry(path);
     const arrayBuffer = await res.arrayBuffer();
     return Buffer.from(arrayBuffer);
   }
 
-  /** Runs a standard REST SOQL query and follows nextRecordsUrl until done. */
-  async queryPaginated(soql: string): Promise<any[]> {
+  /**
+   * Follows nextRecordsUrl pagination starting from initialPath until all records
+   * are collected. Used by both queryPaginated and toolingQueryPaginated.
+   */
+  private async paginateFrom(initialPath: string): Promise<any[]> {
     const allRecords: any[] = [];
-    let nextPath: string | null = `/query?q=${encodeURIComponent(soql)}`;
+    let nextPath: string | null = initialPath;
 
     while (nextPath) {
       const data = await this.request(nextPath);
@@ -142,27 +136,14 @@ export class SalesforceClient {
     return allRecords;
   }
 
+  /** Runs a standard REST SOQL query and follows nextRecordsUrl until done. */
+  async queryPaginated(soql: string): Promise<any[]> {
+    return this.paginateFrom(`/query?q=${encodeURIComponent(soql)}`);
+  }
+
   /** Runs a Tooling API SOQL query and follows nextRecordsUrl until done. */
   async toolingQueryPaginated(soql: string): Promise<any[]> {
-    const allRecords: any[] = [];
-    let nextPath: string | null = `/tooling/query?q=${encodeURIComponent(soql)}`;
-
-    while (nextPath) {
-      const data = await this.request(nextPath);
-      if (data.records) allRecords.push(...data.records);
-      if (data.done) {
-        nextPath = null;
-      } else if (data.nextRecordsUrl) {
-        nextPath = data.nextRecordsUrl.replace(
-          `/services/data/${API_VERSION}`,
-          ""
-        );
-      } else {
-        nextPath = null;
-      }
-    }
-
-    return allRecords;
+    return this.paginateFrom(`/tooling/query?q=${encodeURIComponent(soql)}`);
   }
 
   /** Fetches a single Tooling API record by type and ID (includes Metadata field). */

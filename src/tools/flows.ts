@@ -4,8 +4,8 @@ import { SalesforceClient } from "../SalesforceClient.js";
 import {
   runWithConcurrency,
   extractSnippets,
-  extractMatchingNodes,
-  FlowNodeMatch,
+  searchFlowMetadata,
+  searchValidationRules,
 } from "../utils.js";
 
 // Tools: sf_get_flows, sf_search_flows, sf_impact_analysis
@@ -40,17 +40,10 @@ export function registerFlowTools(
       try {
         const conditions: string[] = [];
 
-        const FLOW_STATUS_MAP = {
-          Active: "Active",
-          Draft: "Draft",
-          Obsolete: "Obsolete",
-          InvalidDraft: "InvalidDraft",
-        } as const;
-
         if (activeOnly) {
           conditions.push("Status = 'Active'");
         } else if (status) {
-          conditions.push(`Status = '${FLOW_STATUS_MAP[status]}'`);
+          conditions.push(`Status = '${status}'`);
         }
 
         if (processType) {
@@ -145,53 +138,13 @@ export function registerFlowTools(
         }
 
         const results = await runWithConcurrency(
-          flows.map((flow) => async () => {
-            const surfaceText = [
-              flow.MasterLabel,
-              flow.Description,
-              flow.ProcessType,
-            ]
-              .filter(Boolean)
-              .join(" ");
-            const surfaceMatches = searchTerms.filter((t) =>
-              surfaceText.toLowerCase().includes(t.toLowerCase())
-            );
-
-            let matchingNodes: FlowNodeMatch[] = [];
-            let metadataNote: string | null = null;
-
-            try {
-              const detail = await client.toolingRecord("Flow", flow.Id);
-              if (detail.Metadata) {
-                matchingNodes = extractMatchingNodes(
-                  detail.Metadata,
-                  searchTerms
-                );
-              } else {
-                metadataNote =
-                  "Metadata field was null or unavailable for this flow";
-              }
-            } catch {
-              metadataNote = "Failed to retrieve flow metadata";
-            }
-
-            const deepMatches = [
-              ...new Set(matchingNodes.flatMap((n) => n.matchedTerms)),
-            ];
-            return { flow, surfaceMatches, deepMatches, matchingNodes, metadataNote };
-          }),
+          flows.map((flow) => () => searchFlowMetadata(client, flow, searchTerms)),
           10
         );
 
         const matches: any[] = [];
 
-        for (const {
-          flow,
-          surfaceMatches,
-          deepMatches,
-          matchingNodes,
-          metadataNote,
-        } of results) {
+        for (const { flow, surfaceMatches, deepMatches, matchingNodes, metadataNote } of results) {
           const allMatchedTerms = [
             ...new Set([...surfaceMatches, ...deepMatches]),
           ];
@@ -272,59 +225,16 @@ export function registerFlowTools(
 
       const limitations: string[] = [];
       const recommendedNextSteps: string[] = [];
-      const validationRuleMatches: any[] = [];
+      let validationRuleMatches: any[] = [];
       const flowMatches: any[] = [];
 
       // Validation Rule Search
       try {
-        const entityId =
-          await client.resolveEntityDefinitionId(objectApiName);
-        const rules = await client.toolingQueryPaginated(
-          `SELECT Id, ValidationName, Active, ErrorDisplayField, ErrorMessage, Description FROM ValidationRule WHERE EntityDefinitionId = '${entityId}'`
-        );
-
-        for (const rule of rules) {
-          let formula: string | null = null;
-
-          try {
-            const detail = await client.toolingRecord(
-              "ValidationRule",
-              rule.Id
-            );
-            formula = detail.Metadata?.conditionFormula ?? null;
-          } catch {
-            limitations.push(
-              `Could not retrieve metadata for validation rule "${rule.ValidationName}" — formula not searched`
-            );
-          }
-
-          const searchableText = [
-            formula,
-            rule.ErrorMessage,
-            rule.ErrorDisplayField,
-            rule.Description,
-            rule.ValidationName,
-          ]
-            .filter(Boolean)
-            .join(" ");
-
-          const matchedTerms = searchTerms.filter((t) =>
-            searchableText.toLowerCase().includes(t.toLowerCase())
-          );
-
-          if (matchedTerms.length > 0) {
-            validationRuleMatches.push({
-              id: rule.Id,
-              name: rule.ValidationName,
-              active: rule.Active,
-              errorDisplayField: rule.ErrorDisplayField,
-              errorMessage: rule.ErrorMessage,
-              conditionFormula: formula,
-              matchedTerms,
-              snippets: extractSnippets(searchableText, matchedTerms),
-            });
-          }
-        }
+        const entityId = await client.resolveEntityDefinitionId(objectApiName);
+        const { matches, limitations: vrLimitations } =
+          await searchValidationRules(client, entityId, searchTerms);
+        validationRuleMatches = matches;
+        limitations.push(...vrLimitations);
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         limitations.push(`Validation rule search failed: ${msg}`);
@@ -336,50 +246,11 @@ export function registerFlowTools(
         const flows = await client.toolingQueryPaginated(soql);
 
         const flowResults = await runWithConcurrency(
-          flows.map((flow) => async () => {
-            const surfaceText = [
-              flow.MasterLabel,
-              flow.Description,
-              flow.ProcessType,
-            ]
-              .filter(Boolean)
-              .join(" ");
-            const surfaceMatches = searchTerms.filter((t) =>
-              surfaceText.toLowerCase().includes(t.toLowerCase())
-            );
-
-            let matchingNodes: FlowNodeMatch[] = [];
-            let metadataNote: string | null = null;
-
-            try {
-              const detail = await client.toolingRecord("Flow", flow.Id);
-              if (detail.Metadata) {
-                matchingNodes = extractMatchingNodes(
-                  detail.Metadata,
-                  searchTerms
-                );
-              } else {
-                metadataNote = "Metadata unavailable for this flow";
-              }
-            } catch {
-              metadataNote = "Failed to retrieve flow metadata";
-            }
-
-            const deepMatches = [
-              ...new Set(matchingNodes.flatMap((n) => n.matchedTerms)),
-            ];
-            return { flow, surfaceMatches, deepMatches, matchingNodes, metadataNote };
-          }),
+          flows.map((flow) => () => searchFlowMetadata(client, flow, searchTerms)),
           10
         );
 
-        for (const {
-          flow,
-          surfaceMatches,
-          deepMatches,
-          matchingNodes,
-          metadataNote,
-        } of flowResults) {
+        for (const { flow, surfaceMatches, deepMatches, matchingNodes, metadataNote } of flowResults) {
           const allMatchedTerms = [
             ...new Set([...surfaceMatches, ...deepMatches]),
           ];
