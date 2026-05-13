@@ -13,27 +13,30 @@ import { registerFlowTools } from "./tools/flows.js";
 import { registerFileTools } from "./tools/files.js";
 import { registerOpportunityTools } from "./tools/opportunity.js";
 
-// Auth client
+// Auth client — shared across all sessions (stateless, safe to reuse)
 const client = new SalesforceClient();
 
-// Create MCP server
-const server = new McpServer({
-  name: "salesforce-query-mcp",
-  version: "1.0.0",
-});
-
-// Register tools
-registerQueryTools(server, client);
-registerValidationTools(server, client);
-registerFlowTools(server, client);
-registerFileTools(server, client);
-registerOpportunityTools(server, client);
+// McpServer only supports one active transport at a time, so HTTP mode creates
+// a fresh instance per session. Stdio mode creates one and keeps it.
+function createMcpServer(): McpServer {
+  const server = new McpServer({
+    name: "salesforce-query-mcp",
+    version: "1.0.0",
+  });
+  registerQueryTools(server, client);
+  registerValidationTools(server, client);
+  registerFlowTools(server, client);
+  registerFileTools(server, client);
+  registerOpportunityTools(server, client);
+  return server;
+}
 
 // Start server
 // - stdio: local Cursor usage, selected when MCP_HTTP_PORT is not set (default)
 // - HTTP:  remote server mode for the Slack bot, selected via MCP_HTTP_PORT env var or --http flag
 
 async function startStdio() {
+  const server = createMcpServer();
   const transport = new StdioServerTransport();
   await server.connect(transport);
   console.error("Salesforce Query MCP server running on stdio");
@@ -76,7 +79,7 @@ async function startHttp() {
         delete sessions[sessionId];
       };
       try {
-        await server.connect(transport);
+        await createMcpServer().connect(transport);
         await transport.handleRequest(req, res, req.body);
       } catch (err) {
         console.error("MCP init error:", err);
