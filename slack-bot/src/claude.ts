@@ -6,6 +6,10 @@ const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 // Override via ANTHROPIC_MODEL env var if you want to pin a specific version
 const MODEL = process.env.ANTHROPIC_MODEL ?? "claude-opus-4-5";
 
+// Cap individual tool results to avoid blowing past Claude's 200k token context limit.
+// Salesforce describe/flow metadata responses can be very large.
+const MAX_TOOL_RESULT_CHARS = 40_000;
+
 const SYSTEM_PROMPT = `You are a Salesforce assistant for the RevOps team at HockeyStack. You have tools to query Salesforce data, analyze flows, validation rules, and opportunity documents.
 
 Guidelines:
@@ -21,6 +25,14 @@ Guidelines:
 export interface Message {
   role: "user" | "assistant";
   content: string;
+}
+
+function truncateToolResult(result: string): string {
+  if (result.length <= MAX_TOOL_RESULT_CHARS) return result;
+  return (
+    result.slice(0, MAX_TOOL_RESULT_CHARS) +
+    `\n\n[Result truncated at ${MAX_TOOL_RESULT_CHARS.toLocaleString()} characters — the full response was too large to include. Summarize what you have.]`
+  );
 }
 
 // Runs the full Claude agentic loop for one user message.
@@ -39,7 +51,7 @@ export async function runClaudeLoop(
 
     let response = await anthropic.messages.create({
       model: MODEL,
-      max_tokens: 4096,
+      max_tokens: 2048,
       system: SYSTEM_PROMPT,
       tools: session.tools,
       messages,
@@ -54,7 +66,7 @@ export async function runClaudeLoop(
       const toolResults: Anthropic.ToolResultBlockParam[] = await Promise.all(
         toolUses.map(async (toolUse) => {
           try {
-            const result = await callMcpTool(
+            const raw = await callMcpTool(
               session.client,
               toolUse.name,
               toolUse.input as Record<string, unknown>
@@ -62,7 +74,7 @@ export async function runClaudeLoop(
             return {
               type: "tool_result" as const,
               tool_use_id: toolUse.id,
-              content: result,
+              content: truncateToolResult(raw),
             };
           } catch (err) {
             return {
@@ -80,7 +92,7 @@ export async function runClaudeLoop(
 
       response = await anthropic.messages.create({
         model: MODEL,
-        max_tokens: 4096,
+        max_tokens: 2048,
         system: SYSTEM_PROMPT,
         tools: session.tools,
         messages,
