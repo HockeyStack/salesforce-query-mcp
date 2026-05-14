@@ -6,7 +6,7 @@ module.exports = {
       cwd: "/home/revops-mcp/salesforce-query-mcp",
       interpreter: "node",
       env_file: "/home/revops-mcp/salesforce-query-mcp/.env",
-      // HTTP mode — MCP_HTTP_PORT being set is what switches the server from stdio to HTTP
+      // HTTP mode - MCP_HTTP_PORT being set is what switches the server from stdio to HTTP
       env: {
         NODE_ENV: "production",
         MCP_HTTP_PORT: "3001",

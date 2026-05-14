@@ -57,7 +57,7 @@ export async function runClaudeLoop(
       messages,
     });
 
-    // Tool call loop — Claude may call multiple tools across multiple turns
+    // Tool call loop - Claude may call multiple tools across multiple turns
     while (response.stop_reason === "tool_use") {
       const toolUses = response.content.filter(
         (b): b is Anthropic.ToolUseBlock => b.type === "tool_use"

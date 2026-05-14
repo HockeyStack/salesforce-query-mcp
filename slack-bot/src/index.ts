@@ -70,7 +70,7 @@ app.event("app_mention", async ({ event, say }) => {
   handleMessage(text, threadTs, say).catch(console.error);
 });
 
-// Direct messages only — channel mentions are handled by app_mention above.
+// Direct messages only - channel mentions are handled by app_mention above.
 // Without this guard, @mentions in channels fire both handlers and the bot responds twice.
 app.message(async ({ message, say }) => {
   const msg = message as any;

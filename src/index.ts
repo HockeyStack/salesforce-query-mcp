@@ -13,7 +13,7 @@ import { registerFlowTools } from "./tools/flows.js";
 import { registerFileTools } from "./tools/files.js";
 import { registerOpportunityTools } from "./tools/opportunity.js";
 
-// Auth client — shared across all sessions (stateless, safe to reuse)
+// Auth client - shared across all sessions (stateless, safe to reuse)
 const client = new SalesforceClient();
 
 // McpServer only supports one active transport at a time, so HTTP mode creates
