@@ -1,7 +1,11 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { SalesforceClient } from "../SalesforceClient.js";
-import { extractSnippets } from "../utils.js";
+import {
+  extractSnippets,
+  searchValidationRules,
+  VALIDATION_RULE_SOQL_FIELDS,
+} from "../utils.js";
 
 // Tools: sf_get_validation_rules, sf_search_validation_rules
 export function registerValidationTools(
@@ -23,7 +27,7 @@ export function registerValidationTools(
         const entityId = await client.resolveEntityDefinitionId(sobject);
 
         const rules = await client.toolingQueryPaginated(
-          `SELECT Id, ValidationName, Active, ErrorDisplayField, ErrorMessage, Description FROM ValidationRule WHERE EntityDefinitionId = '${entityId}'`
+          `SELECT ${VALIDATION_RULE_SOQL_FIELDS} FROM ValidationRule WHERE EntityDefinitionId = '${entityId}'`
         );
 
         if (!rules.length) {
@@ -119,12 +123,13 @@ export function registerValidationTools(
     async ({ sobject, searchTerms }) => {
       try {
         const entityId = await client.resolveEntityDefinitionId(sobject);
-
-        const rules = await client.toolingQueryPaginated(
-          `SELECT Id, ValidationName, Active, ErrorDisplayField, ErrorMessage, Description FROM ValidationRule WHERE EntityDefinitionId = '${entityId}'`
+        const { matches } = await searchValidationRules(
+          client,
+          entityId,
+          searchTerms
         );
 
-        if (!rules.length) {
+        if (matches.length === 0) {
           return {
             content: [
               {
@@ -132,60 +137,13 @@ export function registerValidationTools(
                 text: JSON.stringify({
                   sobject,
                   searchTerms,
+                  totalRulesSearched: 0,
+                  totalMatches: 0,
                   matches: [],
-                  note: "No validation rules found for this object.",
                 }),
               },
             ],
           };
-        }
-
-        const matches: any[] = [];
-
-        for (const rule of rules) {
-          let formula: string | null = null;
-          let metadataNote: string | null = null;
-
-          try {
-            const detail = await client.toolingRecord("ValidationRule", rule.Id);
-            formula = detail.Metadata?.conditionFormula ?? null;
-            if (!formula) {
-              metadataNote =
-                "Metadata/formula was null — searched other fields only";
-            }
-          } catch {
-            metadataNote =
-              "Failed to retrieve metadata — searched other fields only";
-          }
-
-          const searchableText = [
-            formula,
-            rule.ErrorMessage,
-            rule.ErrorDisplayField,
-            rule.Description,
-            rule.ValidationName,
-          ]
-            .filter(Boolean)
-            .join(" ");
-
-          const matchedTerms = searchTerms.filter((term) =>
-            searchableText.toLowerCase().includes(term.toLowerCase())
-          );
-
-          if (matchedTerms.length > 0) {
-            matches.push({
-              id: rule.Id,
-              name: rule.ValidationName,
-              active: rule.Active,
-              errorDisplayField: rule.ErrorDisplayField,
-              errorMessage: rule.ErrorMessage,
-              description: rule.Description ?? null,
-              conditionFormula: formula,
-              matchedTerms,
-              snippets: extractSnippets(searchableText, matchedTerms),
-              metadataNote,
-            });
-          }
         }
 
         return {
@@ -196,7 +154,6 @@ export function registerValidationTools(
                 {
                   sobject,
                   searchTerms,
-                  totalRulesSearched: rules.length,
                   totalMatches: matches.length,
                   matches,
                 },

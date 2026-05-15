@@ -1,0 +1,39 @@
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  deploy:
+    name: Deploy to DigitalOcean
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: SSH and deploy
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          script: |
+            # Load nvm so node/npm are available in this non-interactive shell
+            export NVM_DIR="$HOME/.nvm"
+            [ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"
+
+            cd /home/revops-mcp/salesforce-query-mcp
+
+            git pull origin main
+
+            # Build MCP server
+            npm ci
+            npm run build
+
+            # Build Slack bot
+            cd slack-bot
+            npm ci
+            npm run build
+            cd ..
+
+            # Reload both PM2 processes with zero downtime
+            pm2 reload ecosystem.config.cjs --update-env
