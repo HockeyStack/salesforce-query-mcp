@@ -20,7 +20,9 @@ Guidelines:
 - Never use em dashes. Use a hyphen (-) or colon instead
 - When running multiple tools, summarize the combined findings clearly
 - If a request is ambiguous, make a reasonable assumption and state it
-- Never expose raw IDs unless asked - use names and labels instead`;
+- Never expose raw IDs unless asked - use names and labels instead
+- For bulk audits (e.g. "audit all my contracts", "check all opportunity dates", "find date discrepancies", "audit all PDFs"), ALWAYS use a compound audit tool like sf_audit_contract_dates or sf_audit_multi_year_splits when one fits the request. NEVER iterate through opportunities one at a time using sf_get_opportunity_files + sf_read_file_as_text for bulk work - that exceeds context limits and produces inconsistent batching and hallucinations
+- If the user asks for "more", "the rest", "keep going", or "next batch" after a compound audit returned its full result set, explain that the tool already returned the complete result in one call. Offer to filter, sort, or drill into specific accounts/opportunities instead`;
 
 export interface Message {
   role: "user" | "assistant";
