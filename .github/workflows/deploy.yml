@@ -2,7 +2,7 @@ name: Deploy
 
 on:
   push:
-    branches: [main]
+    branches: [master]
 
 jobs:
   deploy:
@@ -23,7 +23,7 @@ jobs:
 
             cd /home/revops-mcp/salesforce-query-mcp
 
-            git pull origin main
+            git pull origin master
 
             # Build MCP server
             npm ci
