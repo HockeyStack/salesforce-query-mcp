@@ -66,21 +66,32 @@ export class SalesforceClient {
 
   /**
    * Fetches a Salesforce API path with a single 401-refresh-and-retry.
-   * Shared by request() and requestBinary() to avoid duplicating the auth loop.
+   * Shared by request(), requestBinary(), requestPost(), and requestPatch().
    */
-  private async fetchWithRetry(path: string): Promise<Response> {
+  private async fetchWithRetry(
+    path: string,
+    init: { method?: string; body?: string } = {}
+  ): Promise<Response> {
     await this.ensureToken();
     const url = `${this.instanceUrl}/services/data/${API_VERSION}${path}`;
 
-    let res = await fetch(url, {
-      headers: { Authorization: `Bearer ${this.accessToken}` },
-    });
+    const doFetch = () => {
+      const headers: Record<string, string> = {
+        Authorization: `Bearer ${this.accessToken}`,
+      };
+      if (init.body !== undefined) headers["Content-Type"] = "application/json";
+      return fetch(url, {
+        method: init.method ?? "GET",
+        headers,
+        body: init.body,
+      });
+    };
+
+    let res = await doFetch();
 
     if (res.status === 401) {
       await this.refreshAccessToken();
-      res = await fetch(url, {
-        headers: { Authorization: `Bearer ${this.accessToken}` },
-      });
+      res = await doFetch();
     }
 
     if (!res.ok) {
@@ -108,6 +119,31 @@ export class SalesforceClient {
     const res = await this.fetchWithRetry(path);
     const arrayBuffer = await res.arrayBuffer();
     return Buffer.from(arrayBuffer);
+  }
+
+  /**
+   * POSTs a JSON body to a Salesforce API path. Used for record/metadata creation.
+   * e.g. /tooling/sobjects/Flow, /sobjects/Contact.
+   */
+  async requestPost(path: string, body: unknown): Promise<any> {
+    const res = await this.fetchWithRetry(path, {
+      method: "POST",
+      body: JSON.stringify(body),
+    });
+    // Some Salesforce POST responses are 204 No Content; guard against empty bodies.
+    const text = await res.text();
+    return text ? JSON.parse(text) : null;
+  }
+
+  /**
+   * PATCHes a JSON body to a Salesforce API path. Used for record/metadata updates.
+   * Salesforce returns 204 No Content on successful PATCH.
+   */
+  async requestPatch(path: string, body: unknown): Promise<void> {
+    await this.fetchWithRetry(path, {
+      method: "PATCH",
+      body: JSON.stringify(body),
+    });
   }
 
   /**

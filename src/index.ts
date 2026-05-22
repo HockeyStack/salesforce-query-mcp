@@ -13,6 +13,7 @@ import { registerFlowTools } from "./tools/flows.js";
 import { registerFileTools } from "./tools/files.js";
 import { registerOpportunityTools } from "./tools/opportunity.js";
 import { registerMetadataTools } from "./tools/metadata.js";
+import { registerWritebackTools } from "./tools/writebacks.js";
 
 // Auth client - shared across all sessions (stateless, safe to reuse)
 const client = new SalesforceClient();
@@ -30,6 +31,7 @@ function createMcpServer(): McpServer {
   registerFileTools(server, client);
   registerOpportunityTools(server, client);
   registerMetadataTools(server, client);
+  registerWritebackTools(server, client);
   return server;
 }
 
